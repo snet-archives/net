@@ -268,6 +268,10 @@ type ClientConn struct {
 	// which calls the user hook.
 	internalStateHook func()
 
+	// fp holds the cloned HTTP/2 fingerprint profile bound at ClientConn creation.
+	// Immutable after newClientConn initializes the connection.
+	fp *FingerprintProfile
+
 	// wmu is held while writing.
 	// Acquire BEFORE mu when holding both, to avoid blocking mu on network writes.
 	// Only acquire both at the same time when changing peer settings.
@@ -462,8 +466,80 @@ func (t *Transport) newUserClientConn(c net.Conn) (*ClientConn, error) {
 	return t.newClientConn(c, t.disableKeepAlives(), nil)
 }
 
+func resolveFingerprintConnParams(fp *FingerprintProfile, conf http2Config, defaultMaxHeaderList uint32) (
+	initialSettings []Setting,
+	initialStreamRecvWindow int32,
+	maxReadFrameSize uint32,
+	maxHeaderTableSize uint32,
+	maxHeaderListSize uint32,
+	connFlow int32,
+	sendConnWindowUpdate bool,
+) {
+	maxHeaderListSize = defaultMaxHeaderList
+	if fp != nil && len(fp.Settings) > 0 {
+		// Apply RFC 9113 defaults before synchronizing explicit SETTINGS overrides.
+		initialStreamRecvWindow = int32(initialWindowSize)
+		maxReadFrameSize = minMaxFrameSize
+		maxHeaderTableSize = initialHeaderTableSize
+		initialSettings = make([]Setting, len(fp.Settings))
+		for i, s := range fp.Settings {
+			switch s.ID {
+			case SettingHeaderTableSize:
+				maxHeaderTableSize = s.Val
+			case SettingInitialWindowSize:
+				if s.Val > math.MaxInt32 {
+					s.Val = math.MaxInt32
+				}
+				initialStreamRecvWindow = int32(s.Val)
+			case SettingMaxFrameSize:
+				if s.Val < minMaxFrameSize {
+					s.Val = minMaxFrameSize
+				} else if s.Val > maxFrameSize {
+					s.Val = maxFrameSize
+				}
+				maxReadFrameSize = s.Val
+			case SettingMaxHeaderListSize:
+				if s.Val > 0 {
+					maxHeaderListSize = s.Val
+				}
+			}
+			initialSettings[i] = s
+		}
+	} else {
+		initialStreamRecvWindow = conf.MaxUploadBufferPerStream
+		maxReadFrameSize = conf.MaxReadFrameSize
+		maxHeaderTableSize = conf.MaxDecoderHeaderTableSize
+		initialSettings = []Setting{
+			{ID: SettingEnablePush, Val: 0},
+			{ID: SettingInitialWindowSize, Val: uint32(initialStreamRecvWindow)},
+			{ID: SettingMaxFrameSize, Val: maxReadFrameSize},
+		}
+		if defaultMaxHeaderList != 0 {
+			initialSettings = append(initialSettings, Setting{ID: SettingMaxHeaderListSize, Val: defaultMaxHeaderList})
+		}
+		if maxHeaderTableSize != initialHeaderTableSize {
+			initialSettings = append(initialSettings, Setting{ID: SettingHeaderTableSize, Val: maxHeaderTableSize})
+		}
+	}
+
+	if fp != nil && fp.SkipConnectionFlow {
+		return initialSettings, initialStreamRecvWindow, maxReadFrameSize, maxHeaderTableSize, maxHeaderListSize, 0, false
+	}
+	if fp != nil && fp.ConnectionFlow > 0 {
+		cf := fp.ConnectionFlow
+		if uint64(cf)+initialWindowSize > math.MaxInt32 {
+			cf = math.MaxInt32 - initialWindowSize
+		}
+		return initialSettings, initialStreamRecvWindow, maxReadFrameSize, maxHeaderTableSize, maxHeaderListSize, int32(cf), true
+	}
+	return initialSettings, initialStreamRecvWindow, maxReadFrameSize, maxHeaderTableSize, maxHeaderListSize, conf.MaxUploadBufferPerConnection, true
+}
+
 func (t *Transport) newClientConn(c net.Conn, singleUse bool, internalStateHook func()) (*ClientConn, error) {
 	conf := configFromTransport(t)
+	fp := t.Fingerprint.Clone()
+	initialSettings, initialStreamRecvWindow, maxReadFrameSize, maxHeaderTableSize, maxHeaderListSize, connFlow, sendConnWindowUpdate :=
+		resolveFingerprintConnParams(fp, conf, t.maxHeaderListSize())
 	cc := &ClientConn{
 		t:                           t,
 		tconn:                       c,
@@ -471,7 +547,7 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool, internalStateHook 
 		nextStreamID:                1,
 		maxFrameSize:                16 << 10, // spec default
 		initialWindowSize:           65535,    // spec default
-		initialStreamRecvWindowSize: conf.MaxUploadBufferPerStream,
+		initialStreamRecvWindowSize: initialStreamRecvWindow,
 		maxConcurrentStreams:        initialMaxConcurrentStreams, // "infinite", per spec. Use a smaller value until we have received server settings.
 		strictMaxConcurrentStreams:  conf.StrictMaxConcurrentRequests,
 		peerMaxHeaderListSize:       0xffffffffffffffff, // "infinite", per spec. Use 2^64-1 instead.
@@ -485,6 +561,7 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool, internalStateHook 
 		reqHeaderMu:                 make(chan struct{}, 1),
 		lastActive:                  time.Now(),
 		internalStateHook:           internalStateHook,
+		fp:                          fp,
 	}
 	if t.transportTestHooks != nil {
 		t.transportTestHooks.newclientconn(cc)
@@ -506,13 +583,12 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool, internalStateHook 
 	})
 	cc.br = bufio.NewReader(c)
 	cc.fr = NewFramer(cc.bw, cc.br)
-	cc.fr.SetMaxReadFrameSize(conf.MaxReadFrameSize)
+	cc.fr.SetMaxReadFrameSize(maxReadFrameSize)
 	if t.CountError != nil {
 		cc.fr.countError = t.CountError
 	}
-	maxHeaderTableSize := conf.MaxDecoderHeaderTableSize
 	cc.fr.ReadMetaHeaders = hpack.NewDecoder(maxHeaderTableSize, nil)
-	cc.fr.MaxHeaderListSize = t.maxHeaderListSize()
+	cc.fr.MaxHeaderListSize = maxHeaderListSize
 
 	cc.henc = hpack.NewEncoder(&cc.hbuf)
 	cc.henc.SetMaxDynamicTableSizeLimit(conf.MaxEncoderHeaderTableSize)
@@ -523,22 +599,19 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool, internalStateHook 
 		cc.tlsState = &state
 	}
 
-	initialSettings := []Setting{
-		{ID: SettingEnablePush, Val: 0},
-		{ID: SettingInitialWindowSize, Val: uint32(cc.initialStreamRecvWindowSize)},
-	}
-	initialSettings = append(initialSettings, Setting{ID: SettingMaxFrameSize, Val: conf.MaxReadFrameSize})
-	if max := t.maxHeaderListSize(); max != 0 {
-		initialSettings = append(initialSettings, Setting{ID: SettingMaxHeaderListSize, Val: max})
-	}
-	if maxHeaderTableSize != initialHeaderTableSize {
-		initialSettings = append(initialSettings, Setting{ID: SettingHeaderTableSize, Val: maxHeaderTableSize})
-	}
-
 	cc.bw.Write(clientPreface)
 	cc.fr.WriteSettings(initialSettings...)
-	cc.fr.WriteWindowUpdate(0, uint32(conf.MaxUploadBufferPerConnection))
-	cc.inflow.init(conf.MaxUploadBufferPerConnection + initialWindowSize)
+	if sendConnWindowUpdate {
+		cc.fr.WriteWindowUpdate(0, uint32(connFlow))
+	}
+	cc.inflow.init(connFlow + initialWindowSize)
+	if fp != nil {
+		for _, p := range fp.Priorities {
+			if p.StreamID != 0 {
+				cc.fr.WritePriority(p.StreamID, p.PriorityParam)
+			}
+		}
+	}
 	cc.bw.Flush()
 	if cc.werr != nil {
 		cc.Close()
@@ -1238,7 +1311,7 @@ func (cs *clientStream) encodeAndWriteHeaders(req *http.Request) error {
 	// sent by writeRequestBody below, along with any Trailers,
 	// again in form HEADERS{1}, CONTINUATION{0,})
 	cc.hbuf.Reset()
-	res, err := encodeRequestHeaders(req, cs.requestedGzip, cc.peerMaxHeaderListSize, func(name, value string) {
+	res, err := encodeRequestHeadersWithProfile(req, cs.requestedGzip, cc.peerMaxHeaderListSize, cc.fp, func(name, value string) {
 		cc.writeHeader(name, value)
 	})
 	if err != nil {
@@ -1255,7 +1328,23 @@ func (cs *clientStream) encodeAndWriteHeaders(req *http.Request) error {
 }
 
 func encodeRequestHeaders(req *http.Request, addGzipHeader bool, peerMaxHeaderListSize uint64, headerf func(name, value string)) (httpcommon.EncodeHeadersResult, error) {
-	return httpcommon.EncodeHeaders(req.Context(), httpcommon.EncodeHeadersParam{
+	return encodeRequestHeadersWithProfile(req, addGzipHeader, peerMaxHeaderListSize, nil, headerf)
+}
+
+func encodeRequestHeadersWithProfile(req *http.Request, addGzipHeader bool, peerMaxHeaderListSize uint64, fp *FingerprintProfile, headerf func(name, value string)) (httpcommon.EncodeHeadersResult, error) {
+	var pseudoOrder, headerOrder []string
+	if fp != nil {
+		pseudoOrder = fp.PseudoHeaderOrder
+		headerOrder = fp.HeaderOrder
+	}
+	ctx := req.Context()
+	if order := PseudoHeaderOrderFromContext(ctx); len(order) > 0 {
+		pseudoOrder = order
+	}
+	if order := HeaderOrderFromContext(ctx); len(order) > 0 {
+		headerOrder = order
+	}
+	return httpcommon.EncodeHeaders(ctx, httpcommon.EncodeHeadersParam{
 		Request: httpcommon.Request{
 			Header:              req.Header,
 			Trailer:             req.Trailer,
@@ -1267,6 +1356,8 @@ func encodeRequestHeaders(req *http.Request, addGzipHeader bool, peerMaxHeaderLi
 		AddGzipHeader:         addGzipHeader,
 		PeerMaxHeaderListSize: peerMaxHeaderListSize,
 		DefaultUserAgent:      defaultUserAgent,
+		PseudoHeaderOrder:     pseudoOrder,
+		HeaderOrder:           headerOrder,
 	}, headerf)
 }
 
@@ -1417,11 +1508,16 @@ func (cc *ClientConn) writeHeaders(streamID uint32, endStream bool, maxFrameSize
 		hdrs = hdrs[len(chunk):]
 		endHeaders := len(hdrs) == 0
 		if first {
+			var headerPriority PriorityParam
+			if cc.fp != nil && !cc.fp.HeaderPriority.IsZero() {
+				headerPriority = cc.fp.HeaderPriority
+			}
 			cc.fr.WriteHeaders(HeadersFrameParam{
 				StreamID:      streamID,
 				BlockFragment: chunk,
 				EndStream:     endStream,
 				EndHeaders:    endHeaders,
+				Priority:      headerPriority,
 			})
 			first = false
 		} else {

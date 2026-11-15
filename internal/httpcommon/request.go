@@ -49,6 +49,18 @@ type EncodeHeadersParam struct {
 	// DefaultUserAgent is the User-Agent header to send when the request
 	// neither contains a User-Agent nor disables it.
 	DefaultUserAgent string
+
+	// PseudoHeaderOrder optionally specifies the emission order for pseudo-header
+	// fields (such as ":method", ":authority", ":scheme", ":path"). Applicable
+	// pseudo-headers not present in this slice are emitted afterwards in default
+	// order. Non-pseudo field names are ignored.
+	PseudoHeaderOrder []string
+
+	// HeaderOrder optionally specifies regular header field names (matched
+	// case-insensitively) to emit in order before any remaining headers.
+	// Remaining regular headers are emitted sorted deterministically by
+	// lowercase name instead of Go map iteration order.
+	HeaderOrder []string
 }
 
 // EncodeHeadersResult is the result of EncodeHeaders.
@@ -135,93 +147,74 @@ func EncodeHeaders(ctx context.Context, param EncodeHeadersParam, headerf func(n
 		// target URI (the path-absolute production and optionally a '?' character
 		// followed by the query production, see Sections 3.3 and 3.4 of
 		// [RFC3986]).
-		f(":authority", host)
 		m := req.Method
 		if m == "" {
 			m = "GET"
 		}
-		f(":method", m)
-		if !isNormalConnect {
-			f(":path", path)
-			f(":scheme", req.URL.Scheme)
-		}
-		if protocol != "" {
-			f(":protocol", protocol)
-		}
-		if trailers != "" {
-			f("trailer", trailers)
-		}
+		emitPseudoHeaders(f, param.PseudoHeaderOrder, host, m, path, req.URL.Scheme, protocol, isNormalConnect)
 
-		var didUA bool
-		for k, vv := range req.Header {
-			if asciiEqualFold(k, "host") || asciiEqualFold(k, "content-length") {
-				// Host is :authority, already sent.
-				// Content-Length is automatic, set below.
-				continue
-			} else if asciiEqualFold(k, "connection") ||
-				asciiEqualFold(k, "proxy-connection") ||
-				asciiEqualFold(k, "transfer-encoding") ||
-				asciiEqualFold(k, "upgrade") ||
-				asciiEqualFold(k, "keep-alive") {
-				// Per 8.1.2.2 Connection-Specific Header
-				// Fields, don't send connection-specific
-				// fields. We have already checked if any
-				// are error-worthy so just ignore the rest.
-				continue
-			} else if asciiEqualFold(k, "user-agent") {
-				// Match Go's http1 behavior: at most one
-				// User-Agent. If set to nil or empty string,
-				// then omit it. Otherwise if not mentioned,
-				// include the default (below).
-				didUA = true
-				if len(vv) < 1 {
+		if len(param.HeaderOrder) == 0 {
+			if trailers != "" {
+				f("trailer", trailers)
+			}
+
+			var didUA bool
+			for k, vv := range req.Header {
+				if asciiEqualFold(k, "host") || asciiEqualFold(k, "content-length") {
+					// Host is :authority, already sent.
+					// Content-Length is automatic, set below.
+					continue
+				} else if asciiEqualFold(k, "connection") ||
+					asciiEqualFold(k, "proxy-connection") ||
+					asciiEqualFold(k, "transfer-encoding") ||
+					asciiEqualFold(k, "upgrade") ||
+					asciiEqualFold(k, "keep-alive") {
+					// Per 8.1.2.2 Connection-Specific Header
+					// Fields, don't send connection-specific
+					// fields. We have already checked if any
+					// are error-worthy so just ignore the rest.
+					continue
+				} else if asciiEqualFold(k, "user-agent") {
+					// Match Go's http1 behavior: at most one
+					// User-Agent. If set to nil or empty string,
+					// then omit it. Otherwise if not mentioned,
+					// include the default (below).
+					didUA = true
+					if len(vv) < 1 {
+						continue
+					}
+					vv = vv[:1]
+					if vv[0] == "" {
+						continue
+					}
+				} else if asciiEqualFold(k, "cookie") {
+					// Per 8.1.2.5 To allow for better compression efficiency, the
+					// Cookie header field MAY be split into separate header fields,
+					// each with one or more cookie-pairs.
+					emitCookies(f, vv)
+					continue
+				} else if k == ":protocol" {
+					// :protocol pseudo-header was already sent above.
 					continue
 				}
-				vv = vv[:1]
-				if vv[0] == "" {
-					continue
-				}
-			} else if asciiEqualFold(k, "cookie") {
-				// Per 8.1.2.5 To allow for better compression efficiency, the
-				// Cookie header field MAY be split into separate header fields,
-				// each with one or more cookie-pairs.
+
 				for _, v := range vv {
-					for {
-						p := strings.IndexByte(v, ';')
-						if p < 0 {
-							break
-						}
-						f("cookie", v[:p])
-						p++
-						// strip space after semicolon if any.
-						for p+1 <= len(v) && v[p] == ' ' {
-							p++
-						}
-						v = v[p:]
-					}
-					if len(v) > 0 {
-						f("cookie", v)
-					}
+					f(k, v)
 				}
-				continue
-			} else if k == ":protocol" {
-				// :protocol pseudo-header was already sent above.
-				continue
 			}
+			if shouldSendReqContentLength(req.Method, req.ActualContentLength) {
+				f("content-length", strconv.FormatInt(req.ActualContentLength, 10))
+			}
+			if param.AddGzipHeader {
+				f("accept-encoding", "gzip")
+			}
+			if !didUA {
+				f("user-agent", param.DefaultUserAgent)
+			}
+			return
+		}
 
-			for _, v := range vv {
-				f(k, v)
-			}
-		}
-		if shouldSendReqContentLength(req.Method, req.ActualContentLength) {
-			f("content-length", strconv.FormatInt(req.ActualContentLength, 10))
-		}
-		if param.AddGzipHeader {
-			f("accept-encoding", "gzip")
-		}
-		if !didUA {
-			f("user-agent", param.DefaultUserAgent)
-		}
+		emitOrderedRegularHeaders(f, param.HeaderOrder, req, trailers, param.AddGzipHeader, param.DefaultUserAgent)
 	}
 
 	// Do a first pass over the headers counting bytes to ensure
@@ -471,5 +464,192 @@ func NewServerRequest(rp ServerRequestParam) ServerRequestResult {
 		NeedsContinue: needsContinue,
 		RequestURI:    requestURI,
 		Trailer:       trailer,
+	}
+}
+
+func emitPseudoHeaders(f func(name, value string), order []string, host, method, path, scheme, protocol string, isNormalConnect bool) {
+	if len(order) == 0 {
+		f(":authority", host)
+		f(":method", method)
+		if !isNormalConnect {
+			f(":path", path)
+			f(":scheme", scheme)
+		}
+		if protocol != "" {
+			f(":protocol", protocol)
+		}
+		return
+	}
+
+	valueOf := func(name string) (string, bool) {
+		switch name {
+		case ":authority":
+			return host, true
+		case ":method":
+			return method, true
+		case ":path":
+			if isNormalConnect {
+				return "", false
+			}
+			return path, true
+		case ":scheme":
+			if isNormalConnect {
+				return "", false
+			}
+			return scheme, true
+		case ":protocol":
+			if protocol == "" {
+				return "", false
+			}
+			return protocol, true
+		default:
+			return "", false
+		}
+	}
+
+	var emitted [5]bool
+	mark := func(name string) int {
+		switch name {
+		case ":authority":
+			return 0
+		case ":method":
+			return 1
+		case ":path":
+			return 2
+		case ":scheme":
+			return 3
+		case ":protocol":
+			return 4
+		default:
+			return -1
+		}
+	}
+
+	for _, raw := range order {
+		name, ascii := LowerHeader(raw)
+		if !ascii || !strings.HasPrefix(name, ":") {
+			continue
+		}
+		idx := mark(name)
+		if idx < 0 || emitted[idx] {
+			continue
+		}
+		if val, ok := valueOf(name); ok {
+			emitted[idx] = true
+			f(name, val)
+		}
+	}
+
+	defaults := [5]string{":authority", ":method", ":path", ":scheme", ":protocol"}
+	for i, name := range defaults {
+		if emitted[i] {
+			continue
+		}
+		if val, ok := valueOf(name); ok {
+			f(name, val)
+		}
+	}
+}
+
+func emitCookies(f func(name, value string), vv []string) {
+	for _, v := range vv {
+		for {
+			p := strings.IndexByte(v, ';')
+			if p < 0 {
+				break
+			}
+			f("cookie", v[:p])
+			p++
+			for p+1 <= len(v) && v[p] == ' ' {
+				p++
+			}
+			v = v[p:]
+		}
+		if len(v) > 0 {
+			f("cookie", v)
+		}
+	}
+}
+
+func emitOrderedRegularHeaders(f func(name, value string), order []string, req Request, trailers string, addGzip bool, defaultUA string) {
+	byLower := make(map[string][]string, len(req.Header)+4)
+	reqKeys := make([]string, 0, len(req.Header))
+	for k := range req.Header {
+		reqKeys = append(reqKeys, k)
+	}
+	sort.Strings(reqKeys)
+
+	var didUA bool
+	for _, k := range reqKeys {
+		vv := req.Header[k]
+		if asciiEqualFold(k, "host") || asciiEqualFold(k, "content-length") ||
+			asciiEqualFold(k, "connection") || asciiEqualFold(k, "proxy-connection") ||
+			asciiEqualFold(k, "transfer-encoding") || asciiEqualFold(k, "upgrade") ||
+			asciiEqualFold(k, "keep-alive") || k == ":protocol" {
+			continue
+		}
+		if asciiEqualFold(k, "user-agent") {
+			if didUA {
+				continue
+			}
+			didUA = true
+			if len(vv) > 0 && vv[0] != "" {
+				byLower["user-agent"] = []string{vv[0]}
+			}
+			continue
+		}
+		if asciiEqualFold(k, "cookie") {
+			emitCookies(func(_, val string) {
+				byLower["cookie"] = append(byLower["cookie"], val)
+			}, vv)
+			continue
+		}
+		lower, ascii := LowerHeader(k)
+		if !ascii {
+			lower = k
+		}
+		byLower[lower] = append(byLower[lower], vv...)
+	}
+
+	if trailers != "" {
+		byLower["trailer"] = append(byLower["trailer"], trailers)
+	}
+	if shouldSendReqContentLength(req.Method, req.ActualContentLength) {
+		byLower["content-length"] = append(byLower["content-length"], strconv.FormatInt(req.ActualContentLength, 10))
+	}
+	if addGzip {
+		byLower["accept-encoding"] = append(byLower["accept-encoding"], "gzip")
+	}
+	if !didUA {
+		byLower["user-agent"] = []string{defaultUA}
+	}
+
+	emitted := make(map[string]bool, len(byLower))
+	for _, raw := range order {
+		lower, ascii := LowerHeader(raw)
+		if !ascii || strings.HasPrefix(lower, ":") || emitted[lower] {
+			continue
+		}
+		vals, ok := byLower[lower]
+		if !ok {
+			continue
+		}
+		emitted[lower] = true
+		for _, v := range vals {
+			f(lower, v)
+		}
+	}
+
+	remaining := make([]string, 0, len(byLower)-len(emitted))
+	for k := range byLower {
+		if !emitted[k] {
+			remaining = append(remaining, k)
+		}
+	}
+	sort.Strings(remaining)
+	for _, k := range remaining {
+		for _, v := range byLower[k] {
+			f(k, v)
+		}
 	}
 }

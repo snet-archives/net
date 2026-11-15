@@ -152,6 +152,11 @@ type Transport struct {
 	// The errType consists of only ASCII word characters.
 	CountError func(errType string)
 
+	// Fingerprint, if non-nil, customizes the HTTP/2 connection preface SETTINGS,
+	// initial connection-level WINDOW_UPDATE, optional PRIORITY frames, and header ordering.
+	// It is cloned on connection setup and safe for concurrent reuse across dials.
+	Fingerprint *FingerprintProfile
+
 	// Internal state, differs between wrapped and non-wrapped implementations.
 	transportInternal
 }

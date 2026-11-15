@@ -670,3 +670,55 @@ func must[T any](v T, err error) T {
 	}
 	return v
 }
+
+func TestEncodeHeadersOrdered(t *testing.T) {
+	type headerField struct {
+		name, value string
+	}
+	req := must(http.NewRequest("GET", "https://example.tld/test?a=1", nil))
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Sec-CH-UA", `"Chromium";v="144"`)
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("X-Beta", "b")
+	req.Header.Set("X-Alpha", "a")
+	req.Header.Add("Cookie", "k1=v1; k2=v2")
+
+	var got []headerField
+	_, err := EncodeHeaders(context.Background(), EncodeHeadersParam{
+		Request: Request{
+			Header:              req.Header,
+			URL:                 req.URL,
+			Host:                req.Host,
+			Method:              req.Method,
+			ActualContentLength: 0,
+		},
+		AddGzipHeader:     true,
+		DefaultUserAgent:  "CustomUA/1.0",
+		PseudoHeaderOrder: []string{":method", ":authority", ":scheme", ":path"},
+		HeaderOrder:       []string{"sec-ch-ua", "user-agent", "accept", "accept-encoding", "accept-language", "cookie"},
+	}, func(name, value string) {
+		got = append(got, headerField{name, value})
+	})
+	if err != nil {
+		t.Fatalf("EncodeHeaders: %v", err)
+	}
+
+	want := []headerField{
+		{":method", "GET"},
+		{":authority", "example.tld"},
+		{":scheme", "https"},
+		{":path", "/test?a=1"},
+		{"sec-ch-ua", `"Chromium";v="144"`},
+		{"user-agent", "CustomUA/1.0"},
+		{"accept", "*/*"},
+		{"accept-encoding", "gzip"},
+		{"accept-language", "en-US,en;q=0.9"},
+		{"cookie", "k1=v1"},
+		{"cookie", "k2=v2"},
+		{"x-alpha", "a"},
+		{"x-beta", "b"},
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got headers:\n%v\nwant:\n%v", got, want)
+	}
+}
