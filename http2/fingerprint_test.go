@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"golang.org/x/net/http2/hpack"
@@ -43,8 +44,29 @@ func TestFingerprintForUTLSAndClone(t *testing.T) {
 	cloned.Settings[0].Val = 1234
 	cloned.PseudoHeaderOrder[0] = ":path"
 	cloned.HeaderOrder[0] = "x-other"
-	if orig.Settings[0].Val == 1234 || orig.PseudoHeaderOrder[0] == ":path" || orig.HeaderOrder[0] == "x-other" {
+	cloned.SensitiveHeaders[0] = "x-secret"
+	if orig.Settings[0].Val == 1234 || orig.PseudoHeaderOrder[0] == ":path" || orig.HeaderOrder[0] == "x-other" || orig.SensitiveHeaders[0] == "x-secret" {
 		t.Fatal("Clone did not isolate slices")
+	}
+	for _, fp := range []*FingerprintProfile{
+		FingerprintChrome(),
+		FingerprintEdge(),
+		FingerprintAndroid(),
+		FingerprintFirefox(),
+		FingerprintFirefox120(),
+		FingerprintSafari(),
+		FingerprintSafari16(),
+		FingerprintIOS(),
+	} {
+		if fp.DefaultUserAgent == "" || strings.Contains(fp.DefaultUserAgent, "Go-http-client") {
+			t.Fatalf("%s profile has invalid DefaultUserAgent %q", fp.Name, fp.DefaultUserAgent)
+		}
+		if fp.ConnWindowRefreshRatio != 0.5 || fp.StreamWindowRefreshRatio != 0.5 {
+			t.Fatalf("%s profile unexpected refresh ratios: conn=%v stream=%v", fp.Name, fp.ConnWindowRefreshRatio, fp.StreamWindowRefreshRatio)
+		}
+		if !slices.Contains(fp.SensitiveHeaders, "cookie") || !slices.Contains(fp.SensitiveHeaders, "authorization") {
+			t.Fatalf("%s profile missing sensitive cookie/authorization headers: %v", fp.Name, fp.SensitiveHeaders)
+		}
 	}
 
 	// Oversized ConnectionFlow and InitialWindowSize clamp cleanly within RFC 9113 bounds.
@@ -75,14 +97,16 @@ func TestFingerprintForUTLSAndClone(t *testing.T) {
 }
 
 type capturedH2Request struct {
-	Settings      []Setting
-	HasConnWU     bool
-	ConnWU        uint32
-	Priorities    []PrioritySpec
-	HeaderPrio    PriorityParam
-	HasHeaderPrio bool
-	PseudoOrder   []string
-	HeaderOrder   []string
+	Settings        []Setting
+	HasConnWU       bool
+	ConnWU          uint32
+	Priorities      []PrioritySpec
+	HeaderPrio      PriorityParam
+	HasHeaderPrio   bool
+	PseudoOrder     []string
+	HeaderOrder     []string
+	Fields          []hpack.HeaderField
+	PriorityUpdates []PriorityUpdateFrame
 }
 
 func captureWireFingerprint(
@@ -159,6 +183,7 @@ func captureWireFingerprint(
 			case *MetaHeadersFrame:
 				got.HasHeaderPrio = f.HasPriority()
 				got.HeaderPrio = f.Priority
+				got.Fields = slices.Clone(f.Fields)
 				for _, hf := range f.Fields {
 					if hf.IsPseudo() {
 						got.PseudoOrder = append(got.PseudoOrder, hf.Name)
@@ -463,5 +488,607 @@ func TestFingerprintEndToEndServerTransfer(t *testing.T) {
 			tr.CloseIdleConnections()
 			<-done
 		})
+	}
+}
+
+func TestFingerprintDefaultUserAgentFallback(t *testing.T) {
+	chrome := FingerprintChrome()
+
+	t.Run("omitted_uses_profile_default", func(t *testing.T) {
+		got := captureWireFingerprint(t, context.Background(), chrome, http.Header{
+			"Accept": {"*/*"},
+		})
+		var ua string
+		for _, hf := range got.Fields {
+			if hf.Name == "user-agent" {
+				ua = hf.Value
+			}
+		}
+		if ua != chrome.DefaultUserAgent {
+			t.Fatalf("user-agent mismatch: got %q, want %q", ua, chrome.DefaultUserAgent)
+		}
+		if strings.Contains(ua, "Go-http-client") {
+			t.Fatalf("leaked Go default user-agent: %q", ua)
+		}
+	})
+
+	t.Run("explicit_nil_suppressed", func(t *testing.T) {
+		got := captureWireFingerprint(t, context.Background(), chrome, http.Header{
+			"User-Agent": nil,
+		})
+		for _, hf := range got.Fields {
+			if hf.Name == "user-agent" {
+				t.Fatalf("expected suppressed user-agent, got %q", hf.Value)
+			}
+		}
+	})
+
+	t.Run("explicit_value_preserved", func(t *testing.T) {
+		got := captureWireFingerprint(t, context.Background(), chrome, http.Header{
+			"User-Agent": {"custom-agent/9.9"},
+		})
+		var ua string
+		for _, hf := range got.Fields {
+			if hf.Name == "user-agent" {
+				ua = hf.Value
+			}
+		}
+		if ua != "custom-agent/9.9" {
+			t.Fatalf("custom user-agent lost: got %q", ua)
+		}
+	})
+
+	t.Run("nil_profile_preserves_go_default", func(t *testing.T) {
+		got := captureWireFingerprint(t, context.Background(), nil, http.Header{})
+		var ua string
+		for _, hf := range got.Fields {
+			if hf.Name == "user-agent" {
+				ua = hf.Value
+			}
+		}
+		if ua != defaultUserAgent {
+			t.Fatalf("expected vanilla default %q, got %q", defaultUserAgent, ua)
+		}
+	})
+}
+
+func runDownloadCaptureWindowUpdates(
+	t *testing.T,
+	fp *FingerprintProfile,
+	payload []byte,
+	chunkSize int,
+) []WindowUpdateFrame {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	type serverResult struct {
+		wus []WindowUpdateFrame
+		err error
+	}
+	resCh := make(chan serverResult, 1)
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			resCh <- serverResult{err: err}
+			return
+		}
+		defer conn.Close()
+
+		preface := make([]byte, len(clientPreface))
+		if _, err := io.ReadFull(conn, preface); err != nil {
+			resCh <- serverResult{err: err}
+			return
+		}
+		if string(preface) != ClientPreface {
+			resCh <- serverResult{err: fmt.Errorf("unexpected preface %q", preface)}
+			return
+		}
+
+		fr := NewFramer(conn, conn)
+		fr.ReadMetaHeaders = hpack.NewDecoder(65536, nil)
+
+		var writeMu sync.Mutex
+		writeHeaders := func(p HeadersFrameParam) error {
+			writeMu.Lock()
+			defer writeMu.Unlock()
+			return fr.WriteHeaders(p)
+		}
+		writeSettingsAck := func() error {
+			writeMu.Lock()
+			defer writeMu.Unlock()
+			return fr.WriteSettingsAck()
+		}
+		writeData := func(streamID uint32, endStream bool, data []byte) error {
+			writeMu.Lock()
+			defer writeMu.Unlock()
+			return fr.WriteData(streamID, endStream, data)
+		}
+		{
+			writeMu.Lock()
+			err = fr.WriteSettings()
+			writeMu.Unlock()
+			if err != nil {
+				resCh <- serverResult{err: err}
+				return
+			}
+		}
+
+		var (
+			winMu      sync.Mutex
+			winCond    = sync.NewCond(&winMu)
+			connWin    = int64(initialWindowSize)
+			streamWin  = int64(initialWindowSize)
+			closed     bool
+			streamDone = make(chan error, 1)
+			sawReq     bool
+			postWUs    []WindowUpdateFrame
+		)
+
+		sendStream := func(sid uint32) {
+			var hdrBuf bytes.Buffer
+			enc := hpack.NewEncoder(&hdrBuf)
+			_ = enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+			if err := writeHeaders(HeadersFrameParam{
+				StreamID:      sid,
+				BlockFragment: hdrBuf.Bytes(),
+				EndStream:     false,
+				EndHeaders:    true,
+			}); err != nil {
+				streamDone <- err
+				return
+			}
+			for off := 0; off < len(payload); {
+				end := off + chunkSize
+				if end > len(payload) {
+					end = len(payload)
+				}
+				n := int64(end - off)
+				winMu.Lock()
+				for !closed && (connWin < n || streamWin < n) {
+					winCond.Wait()
+				}
+				if closed {
+					winMu.Unlock()
+					streamDone <- nil
+					return
+				}
+				connWin -= n
+				streamWin -= n
+				winMu.Unlock()
+
+				if err := writeData(sid, end == len(payload), payload[off:end]); err != nil {
+					streamDone <- err
+					return
+				}
+				off = end
+			}
+			streamDone <- nil
+		}
+
+		for {
+			f, err := fr.ReadFrame()
+			if err != nil {
+				winMu.Lock()
+				closed = true
+				winCond.Broadcast()
+				winMu.Unlock()
+				if sawReq {
+					<-streamDone
+				}
+				resCh <- serverResult{wus: postWUs}
+				return
+			}
+			switch f := f.(type) {
+			case *SettingsFrame:
+				if !f.IsAck() {
+					_ = f.ForeachSetting(func(s Setting) error {
+						if s.ID == SettingInitialWindowSize {
+							winMu.Lock()
+							streamWin = int64(s.Val)
+							winCond.Broadcast()
+							winMu.Unlock()
+						}
+						return nil
+					})
+					if err := writeSettingsAck(); err != nil {
+						resCh <- serverResult{err: err}
+						return
+					}
+				}
+			case *WindowUpdateFrame:
+				if sawReq {
+					postWUs = append(postWUs, *f)
+				}
+				winMu.Lock()
+				if f.StreamID == 0 {
+					connWin += int64(f.Increment)
+				} else {
+					streamWin += int64(f.Increment)
+				}
+				winCond.Broadcast()
+				winMu.Unlock()
+			case *MetaHeadersFrame:
+				var reqPath string
+				for _, hf := range f.Fields {
+					if hf.Name == ":path" {
+						reqPath = hf.Value
+						break
+					}
+				}
+				if reqPath == "/done" {
+					if sawReq {
+						if err := <-streamDone; err != nil {
+							resCh <- serverResult{err: err}
+							return
+						}
+					}
+					var hdrBuf bytes.Buffer
+					enc := hpack.NewEncoder(&hdrBuf)
+					_ = enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+					_ = writeHeaders(HeadersFrameParam{
+						StreamID:      f.StreamID,
+						BlockFragment: hdrBuf.Bytes(),
+						EndStream:     true,
+						EndHeaders:    true,
+					})
+					winMu.Lock()
+					closed = true
+					winCond.Broadcast()
+					winMu.Unlock()
+					resCh <- serverResult{wus: postWUs}
+					return
+				}
+				sawReq = true
+				go sendStream(f.StreamID)
+			}
+		}
+	}()
+
+	tr := &Transport{
+		AllowHTTP:   true,
+		Fingerprint: fp,
+		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		},
+	}
+	defer tr.CloseIdleConnections()
+
+	client := &http.Client{Transport: tr}
+	resp, err := client.Get("https://" + ln.Addr().String() + "/stream")
+	if err != nil {
+		t.Fatalf("GET /stream failed: %v", err)
+	}
+	gotBody, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatalf("ReadAll(/stream) failed: %v", err)
+	}
+	if !bytes.Equal(gotBody, payload) {
+		t.Fatalf("payload mismatch: got %d bytes, want %d bytes", len(gotBody), len(payload))
+	}
+
+	// Issue a follow-up request on the same HTTP/2 connection so the server frame
+	// reader deterministically drains all post-read WINDOW_UPDATE frames before stopping.
+	doneResp, err := client.Get("https://" + ln.Addr().String() + "/done")
+	if err != nil {
+		t.Fatalf("GET /done failed: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, doneResp.Body)
+	doneResp.Body.Close()
+
+	res := <-resCh
+	if res.err != nil {
+		t.Fatalf("server error: %v", res.err)
+	}
+	return res.wus
+}
+
+func TestFingerprintDynamicWindowRefresh(t *testing.T) {
+	payload := make([]byte, 512<<10)
+	if _, err := io.ReadFull(rand.Reader, payload); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("chrome_suppresses_small_ticks", func(t *testing.T) {
+		fp := FingerprintChrome()
+		wus := runDownloadCaptureWindowUpdates(t, fp, payload, 16<<10)
+		if len(wus) != 0 {
+			t.Fatalf("expected 0 post-preface WINDOW_UPDATE frames for 512 KiB under Chrome profile, got %d: %+v", len(wus), wus)
+		}
+	})
+
+	t.Run("nil_profile_emits_4k_ticks", func(t *testing.T) {
+		wus := runDownloadCaptureWindowUpdates(t, nil, payload, 16<<10)
+		if len(wus) == 0 {
+			t.Fatal("expected vanilla http2 (fp=nil) to emit post-preface WINDOW_UPDATE frames for 512 KiB")
+		}
+	})
+
+	t.Run("custom_threshold_batches_stream_and_conn", func(t *testing.T) {
+		const (
+			streamWin = 256 << 10
+			connFlow  = 256 << 10
+			threshold = 64 << 10
+		)
+		fp := &FingerprintProfile{
+			Name: "batched",
+			Settings: []Setting{
+				{ID: SettingInitialWindowSize, Val: streamWin},
+			},
+			ConnectionFlow:           connFlow,
+			ConnWindowRefreshBytes:   threshold,
+			StreamWindowRefreshBytes: threshold,
+		}
+		// Total 384 KiB exceeds 256 KiB stream window, forcing stream+conn WINDOW_UPDATEs.
+		bigPayload := payload[:384<<10]
+		wus := runDownloadCaptureWindowUpdates(t, fp, bigPayload, 16<<10)
+		var streamUpdates int
+		for _, wu := range wus {
+			if wu.Increment < threshold {
+				t.Fatalf("observed sub-threshold WINDOW_UPDATE (stream=%d inc=%d < %d)", wu.StreamID, wu.Increment, threshold)
+			}
+			if wu.StreamID > 0 {
+				streamUpdates++
+			}
+		}
+		if streamUpdates == 0 {
+			t.Fatal("expected at least one batched stream WINDOW_UPDATE during 384 KiB / 256 KiB transfer")
+		}
+	})
+}
+
+func TestFingerprintHPACKSensitiveHeaders(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	type hpackResult struct {
+		reqs [][]hpack.HeaderField
+		err  error
+	}
+	resCh := make(chan hpackResult, 1)
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			resCh <- hpackResult{err: err}
+			return
+		}
+		defer conn.Close()
+
+		preface := make([]byte, len(clientPreface))
+		if _, err := io.ReadFull(conn, preface); err != nil {
+			resCh <- hpackResult{err: err}
+			return
+		}
+
+		fr := NewFramer(conn, conn)
+		// Deliberately leave fr.ReadMetaHeaders nil so we decode raw HPACK fragments manually.
+		if err := fr.WriteSettings(); err != nil {
+			resCh <- hpackResult{err: err}
+			return
+		}
+
+		dec := hpack.NewDecoder(65536, nil)
+		var captured [][]hpack.HeaderField
+		for {
+			f, err := fr.ReadFrame()
+			if err != nil {
+				resCh <- hpackResult{err: err}
+				return
+			}
+			switch f := f.(type) {
+			case *SettingsFrame:
+				if !f.IsAck() {
+					if err := fr.WriteSettingsAck(); err != nil {
+						resCh <- hpackResult{err: err}
+						return
+					}
+				}
+			case *HeadersFrame:
+				var fields []hpack.HeaderField
+				dec.SetEmitFunc(func(hf hpack.HeaderField) {
+					fields = append(fields, hf)
+				})
+				if _, err := dec.Write(f.HeaderBlockFragment()); err != nil {
+					resCh <- hpackResult{err: err}
+					return
+				}
+				if err := dec.Close(); err != nil {
+					resCh <- hpackResult{err: err}
+					return
+				}
+				captured = append(captured, fields)
+
+				var hdrBuf bytes.Buffer
+				enc := hpack.NewEncoder(&hdrBuf)
+				_ = enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+				if err := fr.WriteHeaders(HeadersFrameParam{
+					StreamID:      f.StreamID,
+					BlockFragment: hdrBuf.Bytes(),
+					EndStream:     true,
+					EndHeaders:    true,
+				}); err != nil {
+					resCh <- hpackResult{err: err}
+					return
+				}
+				if len(captured) == 2 {
+					resCh <- hpackResult{reqs: captured}
+					return
+				}
+			}
+		}
+	}()
+
+	tr := &Transport{
+		AllowHTTP:   true,
+		Fingerprint: FingerprintChrome(),
+		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		},
+	}
+	defer tr.CloseIdleConnections()
+
+	client := &http.Client{Transport: tr}
+	for range 2 {
+		req, err := http.NewRequest(http.MethodGet, "https://"+ln.Addr().String()+"/auth", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Cookie", "sid=secret-session-value")
+		req.Header.Set("Authorization", "Bearer top-secret-token")
+		req.Header.Set("Proxy-Authorization", "Basic dXNlcjpwYXNz")
+		req.Header.Set("X-Normal", "regular-header-value")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+
+	res := <-resCh
+	if res.err != nil {
+		t.Fatalf("server error: %v", res.err)
+	}
+	for reqIdx, fields := range res.reqs {
+		seen := make(map[string]bool)
+		for _, hf := range fields {
+			seen[hf.Name] = hf.Sensitive
+		}
+		for _, sens := range []string{"cookie", "authorization", "proxy-authorization"} {
+			if isSens, ok := seen[sens]; !ok || !isSens {
+				t.Fatalf("req %d header %q Sensitive=%v (present=%v), expected Never Indexed (true)", reqIdx, sens, isSens, ok)
+			}
+		}
+		if isSens, ok := seen["x-normal"]; !ok || isSens {
+			t.Fatalf("req %d header x-normal Sensitive=%v (present=%v), expected false", reqIdx, isSens, ok)
+		}
+	}
+}
+
+func TestFingerprintPriorityUpdate(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	type prioResult struct {
+		reqStreamID uint32
+		updates     []PriorityUpdateFrame
+		err         error
+	}
+	resCh := make(chan prioResult, 1)
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			resCh <- prioResult{err: err}
+			return
+		}
+		defer conn.Close()
+
+		preface := make([]byte, len(clientPreface))
+		if _, err := io.ReadFull(conn, preface); err != nil {
+			resCh <- prioResult{err: err}
+			return
+		}
+		fr := NewFramer(conn, conn)
+		fr.ReadMetaHeaders = hpack.NewDecoder(65536, nil)
+		if err := fr.WriteSettings(); err != nil {
+			resCh <- prioResult{err: err}
+			return
+		}
+
+		var (
+			sid     uint32
+			updates []PriorityUpdateFrame
+		)
+		for {
+			f, err := fr.ReadFrame()
+			if err != nil {
+				resCh <- prioResult{err: err}
+				return
+			}
+			switch f := f.(type) {
+			case *SettingsFrame:
+				if !f.IsAck() {
+					if err := fr.WriteSettingsAck(); err != nil {
+						resCh <- prioResult{err: err}
+						return
+					}
+				}
+			case *MetaHeadersFrame:
+				sid = f.StreamID
+			case *PriorityUpdateFrame:
+				if f.StreamID != 0 {
+					resCh <- prioResult{err: fmt.Errorf("PRIORITY_UPDATE frame must be on stream 0, got %d", f.StreamID)}
+					return
+				}
+				updates = append(updates, *f)
+				if sid != 0 {
+					var hdrBuf bytes.Buffer
+					enc := hpack.NewEncoder(&hdrBuf)
+					_ = enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+					_ = fr.WriteHeaders(HeadersFrameParam{
+						StreamID:      sid,
+						BlockFragment: hdrBuf.Bytes(),
+						EndStream:     true,
+						EndHeaders:    true,
+					})
+					resCh <- prioResult{reqStreamID: sid, updates: updates}
+					return
+				}
+			}
+		}
+	}()
+
+	fp := FingerprintFirefox()
+	fp.HeaderPriorityUpdate = "u=3, i"
+	tr := &Transport{
+		AllowHTTP:   true,
+		Fingerprint: fp,
+		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		},
+	}
+	defer tr.CloseIdleConnections()
+
+	ctx := ContextWithPriorityUpdate(context.Background(), "u=0")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+ln.Addr().String()+"/prio", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip failed: %v", err)
+	}
+	resp.Body.Close()
+
+	res := <-resCh
+	if res.err != nil {
+		t.Fatalf("server error: %v", res.err)
+	}
+	if len(res.updates) != 1 {
+		t.Fatalf("expected 1 PRIORITY_UPDATE frame, got %d", len(res.updates))
+	}
+	if res.updates[0].PrioritizedStreamID != res.reqStreamID {
+		t.Fatalf("PrioritizedStreamID mismatch: got %d, want %d", res.updates[0].PrioritizedStreamID, res.reqStreamID)
+	}
+	if res.updates[0].Priority != "u=0" {
+		t.Fatalf("Priority value mismatch: got %q, want %q", res.updates[0].Priority, "u=0")
 	}
 }

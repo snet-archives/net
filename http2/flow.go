@@ -11,16 +11,26 @@ package http2
 const inflowMinRefresh = 4 << 10
 
 // inflow accounts for an inbound flow control window.
-// It tracks both the latest window sent to the peer (used for enforcement)
-// and the accumulated unsent window.
+// It tracks both the latest window sent to the peer (used for enforcement),
+// the accumulated unsent window, and the minimum refresh threshold.
 type inflow struct {
-	avail  int32
-	unsent int32
+	avail      int32
+	unsent     int32
+	minRefresh int32
 }
 
-// init sets the initial window.
+// init sets the initial window with the default refresh threshold.
 func (f *inflow) init(n int32) {
+	f.initWithRefresh(n, inflowMinRefresh)
+}
+
+// initWithRefresh sets the initial window and minimum WINDOW_UPDATE refresh threshold.
+func (f *inflow) initWithRefresh(n, minRefresh int32) {
 	f.avail = n
+	if minRefresh <= 0 {
+		minRefresh = inflowMinRefresh
+	}
+	f.minRefresh = minRefresh
 }
 
 // add adds n bytes to the window, with a maximum window size of max,
@@ -29,7 +39,7 @@ func (f *inflow) init(n int32) {
 // some of the buffered data, so the peer can now send more.
 // It returns the number of bytes to send in a WINDOW_UPDATE frame to the peer.
 // Window updates are accumulated and sent when the unsent capacity
-// is at least inflowMinRefresh or will at least double the peer's available window.
+// is at least minRefresh or will at least double the peer's available window.
 func (f *inflow) add(n int) (connAdd int32) {
 	if n < 0 {
 		panic("negative update")
@@ -41,9 +51,13 @@ func (f *inflow) add(n int) (connAdd int32) {
 	if unsent+int64(f.avail) > maxWindow {
 		panic("flow control update exceeds maximum window size")
 	}
+	minRefresh := f.minRefresh
+	if minRefresh <= 0 {
+		minRefresh = inflowMinRefresh
+	}
 	f.unsent = int32(unsent)
-	if f.unsent < inflowMinRefresh && f.unsent < f.avail {
-		// If there aren't at least inflowMinRefresh bytes of window to send,
+	if f.unsent < minRefresh && f.unsent < f.avail {
+		// If there aren't at least minRefresh bytes of window to send,
 		// and this update won't at least double the window, buffer the update for later.
 		return 0
 	}

@@ -51,6 +51,32 @@ type FingerprintProfile struct {
 	// HeaderOrder defines the preferred wire order of regular HTTP headers
 	// (lowercase names). Headers not listed are emitted deterministically afterwards.
 	HeaderOrder []string
+
+	// DefaultUserAgent overrides Go's fallback "Go-http-client/2.0" User-Agent
+	// when a request omits User-Agent (explicit nil/empty still suppresses it).
+	DefaultUserAgent string
+
+	// ConnWindowRefreshRatio and ConnWindowRefreshBytes configure the minimum
+	// consumed-window threshold before emitting a connection-level WINDOW_UPDATE.
+	// Explicit positive byte thresholds take precedence over Ratio; both are
+	// safely clamped to at most half of the initial receive window. Zero leaves
+	// Go's 4 KiB default active.
+	ConnWindowRefreshRatio float64
+	ConnWindowRefreshBytes int32
+
+	// StreamWindowRefreshRatio and StreamWindowRefreshBytes configure the minimum
+	// consumed-window threshold before emitting a stream-level WINDOW_UPDATE.
+	StreamWindowRefreshRatio float64
+	StreamWindowRefreshBytes int32
+
+	// SensitiveHeaders lists header names (e.g. "cookie", "authorization",
+	// "proxy-authorization") to encode using HPACK Never Indexed literals
+	// (RFC 7541 Section 7.1.3) rather than adding them to the dynamic table.
+	SensitiveHeaders []string
+
+	// HeaderPriorityUpdate, when non-empty, emits an RFC 9218 PRIORITY_UPDATE
+	// frame (stream 0 targeting the new request stream) coalesced with HEADERS.
+	HeaderPriorityUpdate string
 }
 
 // Clone returns a deep copy of the FingerprintProfile, or nil if p is nil.
@@ -71,12 +97,16 @@ func (p *FingerprintProfile) Clone() *FingerprintProfile {
 	if p.HeaderOrder != nil {
 		cp.HeaderOrder = slices.Clone(p.HeaderOrder)
 	}
+	if p.SensitiveHeaders != nil {
+		cp.SensitiveHeaders = slices.Clone(p.SensitiveHeaders)
+	}
 	return &cp
 }
 
 type (
 	headerOrderContextKey       struct{}
 	pseudoHeaderOrderContextKey struct{}
+	priorityUpdateContextKey    struct{}
 )
 
 // ContextWithHeaderOrder returns a derived context that overrides regular HTTP
@@ -107,6 +137,50 @@ func PseudoHeaderOrderFromContext(ctx context.Context) []string {
 	}
 	order, _ := ctx.Value(pseudoHeaderOrderContextKey{}).([]string)
 	return order
+}
+
+// ContextWithPriorityUpdate returns a derived context that emits an RFC 9218
+// PRIORITY_UPDATE frame payload (e.g. "u=0, i") for requests made through an http2.Transport.
+func ContextWithPriorityUpdate(ctx context.Context, priority string) context.Context {
+	return context.WithValue(ctx, priorityUpdateContextKey{}, priority)
+}
+
+// PriorityUpdateFromContext returns any per-request PRIORITY_UPDATE value stored on ctx.
+func PriorityUpdateFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	p, _ := ctx.Value(priorityUpdateContextKey{}).(string)
+	return p
+}
+
+var defaultBrowserSensitiveHeaders = []string{
+	"cookie",
+	"authorization",
+	"proxy-authorization",
+}
+
+func resolveWindowRefresh(window, explicit int32, ratio float64) int32 {
+	if window <= inflowMinRefresh {
+		return inflowMinRefresh
+	}
+	half := window / 2
+	var target int32
+	if explicit > 0 {
+		target = explicit
+	} else if ratio > 0 {
+		if ratio > 0.5 {
+			ratio = 0.5
+		}
+		target = int32(float64(window) * ratio)
+	}
+	if target <= inflowMinRefresh {
+		return inflowMinRefresh
+	}
+	if half > inflowMinRefresh && target > half {
+		target = half
+	}
+	return target
 }
 
 var (
@@ -169,9 +243,13 @@ func FingerprintChrome() *FingerprintProfile {
 			{ID: SettingInitialWindowSize, Val: 6291456},
 			{ID: SettingMaxHeaderListSize, Val: 262144},
 		},
-		ConnectionFlow:    15663105,
-		PseudoHeaderOrder: []string{":method", ":authority", ":scheme", ":path"},
-		HeaderOrder:       slices.Clone(chromeHeaderOrder),
+		ConnectionFlow:           15663105,
+		PseudoHeaderOrder:        []string{":method", ":authority", ":scheme", ":path"},
+		HeaderOrder:              slices.Clone(chromeHeaderOrder),
+		DefaultUserAgent:         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+		ConnWindowRefreshRatio:   0.5,
+		StreamWindowRefreshRatio: 0.5,
+		SensitiveHeaders:         slices.Clone(defaultBrowserSensitiveHeaders),
 	}
 }
 
@@ -179,6 +257,7 @@ func FingerprintChrome() *FingerprintProfile {
 func FingerprintEdge() *FingerprintProfile {
 	fp := FingerprintChrome()
 	fp.Name = "edge"
+	fp.DefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0"
 	return fp
 }
 
@@ -186,6 +265,7 @@ func FingerprintEdge() *FingerprintProfile {
 func FingerprintAndroid() *FingerprintProfile {
 	fp := FingerprintChrome()
 	fp.Name = "android"
+	fp.DefaultUserAgent = "Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36"
 	return fp
 }
 
@@ -199,9 +279,13 @@ func FingerprintFirefox() *FingerprintProfile {
 			{ID: SettingMaxFrameSize, Val: 16384},
 			{ID: SettingNoRFC7540Priorities, Val: 1},
 		},
-		ConnectionFlow:    12517377,
-		PseudoHeaderOrder: []string{":method", ":path", ":authority", ":scheme"},
-		HeaderOrder:       slices.Clone(firefoxHeaderOrder),
+		ConnectionFlow:           12517377,
+		PseudoHeaderOrder:        []string{":method", ":path", ":authority", ":scheme"},
+		HeaderOrder:              slices.Clone(firefoxHeaderOrder),
+		DefaultUserAgent:         "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0",
+		ConnWindowRefreshRatio:   0.5,
+		StreamWindowRefreshRatio: 0.5,
+		SensitiveHeaders:         slices.Clone(defaultBrowserSensitiveHeaders),
 	}
 }
 
@@ -214,6 +298,7 @@ func FingerprintFirefox120() *FingerprintProfile {
 		{ID: SettingInitialWindowSize, Val: 131072},
 		{ID: SettingMaxFrameSize, Val: 16384},
 	}
+	fp.DefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0"
 	return fp
 }
 
@@ -227,9 +312,13 @@ func FingerprintSafari() *FingerprintProfile {
 			{ID: SettingInitialWindowSize, Val: 4194304},
 			{ID: SettingNoRFC7540Priorities, Val: 1},
 		},
-		ConnectionFlow:    10420225,
-		PseudoHeaderOrder: []string{":method", ":scheme", ":path", ":authority"},
-		HeaderOrder:       slices.Clone(safariHeaderOrder),
+		ConnectionFlow:           10420225,
+		PseudoHeaderOrder:        []string{":method", ":scheme", ":path", ":authority"},
+		HeaderOrder:              slices.Clone(safariHeaderOrder),
+		DefaultUserAgent:         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15",
+		ConnWindowRefreshRatio:   0.5,
+		StreamWindowRefreshRatio: 0.5,
+		SensitiveHeaders:         slices.Clone(defaultBrowserSensitiveHeaders),
 	}
 }
 
@@ -243,6 +332,7 @@ func FingerprintSafari16() *FingerprintProfile {
 		{ID: SettingMaxConcurrentStreams, Val: 100},
 	}
 	fp.ConnectionFlow = 10485760
+	fp.DefaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15"
 	return fp
 }
 
@@ -256,6 +346,7 @@ func FingerprintIOS() *FingerprintProfile {
 		{ID: SettingInitialWindowSize, Val: 2097152},
 		{ID: SettingNoRFC7540Priorities, Val: 1},
 	}
+	fp.DefaultUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1"
 	return fp
 }
 

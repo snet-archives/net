@@ -270,7 +270,8 @@ type ClientConn struct {
 
 	// fp holds the cloned HTTP/2 fingerprint profile bound at ClientConn creation.
 	// Immutable after newClientConn initializes the connection.
-	fp *FingerprintProfile
+	fp            *FingerprintProfile
+	sensitiveHdrs map[string]struct{}
 
 	// wmu is held while writing.
 	// Acquire BEFORE mu when holding both, to avoid blocking mu on network writes.
@@ -604,14 +605,25 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool, internalStateHook 
 	if sendConnWindowUpdate {
 		cc.fr.WriteWindowUpdate(0, uint32(connFlow))
 	}
-	cc.inflow.init(connFlow + initialWindowSize)
+	connWin := connFlow + initialWindowSize
+	connRefresh := int32(inflowMinRefresh)
 	if fp != nil {
+		connRefresh = resolveWindowRefresh(connWin, fp.ConnWindowRefreshBytes, fp.ConnWindowRefreshRatio)
+		if len(fp.SensitiveHeaders) > 0 {
+			cc.sensitiveHdrs = make(map[string]struct{}, len(fp.SensitiveHeaders))
+			for _, h := range fp.SensitiveHeaders {
+				if norm := normalizeProfileToken(h); norm != "" {
+					cc.sensitiveHdrs[norm] = struct{}{}
+				}
+			}
+		}
 		for _, p := range fp.Priorities {
 			if p.StreamID != 0 {
 				cc.fr.WritePriority(p.StreamID, p.PriorityParam)
 			}
 		}
 	}
+	cc.inflow.initWithRefresh(connWin, connRefresh)
 	cc.bw.Flush()
 	if cc.werr != nil {
 		cc.Close()
@@ -1321,8 +1333,15 @@ func (cs *clientStream) encodeAndWriteHeaders(req *http.Request) error {
 
 	// Write the request.
 	endStream := !res.HasBody && !res.HasTrailers
+	var priorityUpdate string
+	if cc.fp != nil {
+		priorityUpdate = cc.fp.HeaderPriorityUpdate
+	}
+	if ctxPrio := PriorityUpdateFromContext(req.Context()); ctxPrio != "" {
+		priorityUpdate = ctxPrio
+	}
 	cs.sentHeaders = true
-	err = cc.writeHeaders(cs.ID, endStream, int(cc.maxFrameSize), hdrs)
+	err = cc.writeHeadersWithPriority(cs.ID, endStream, int(cc.maxFrameSize), hdrs, priorityUpdate)
 	traceWroteHeaders(cs.trace)
 	return err
 }
@@ -1333,9 +1352,13 @@ func encodeRequestHeaders(req *http.Request, addGzipHeader bool, peerMaxHeaderLi
 
 func encodeRequestHeadersWithProfile(req *http.Request, addGzipHeader bool, peerMaxHeaderListSize uint64, fp *FingerprintProfile, headerf func(name, value string)) (httpcommon.EncodeHeadersResult, error) {
 	var pseudoOrder, headerOrder []string
+	defaultUA := defaultUserAgent
 	if fp != nil {
 		pseudoOrder = fp.PseudoHeaderOrder
 		headerOrder = fp.HeaderOrder
+		if fp.DefaultUserAgent != "" {
+			defaultUA = fp.DefaultUserAgent
+		}
 	}
 	ctx := req.Context()
 	if order := PseudoHeaderOrderFromContext(ctx); len(order) > 0 {
@@ -1355,7 +1378,7 @@ func encodeRequestHeadersWithProfile(req *http.Request, addGzipHeader bool, peer
 		},
 		AddGzipHeader:         addGzipHeader,
 		PeerMaxHeaderListSize: peerMaxHeaderListSize,
-		DefaultUserAgent:      defaultUserAgent,
+		DefaultUserAgent:      defaultUA,
 		PseudoHeaderOrder:     pseudoOrder,
 		HeaderOrder:           headerOrder,
 	}, headerf)
@@ -1499,6 +1522,11 @@ func (cc *ClientConn) awaitOpenSlotForStreamLocked(cs *clientStream) error {
 
 // requires cc.wmu be held
 func (cc *ClientConn) writeHeaders(streamID uint32, endStream bool, maxFrameSize int, hdrs []byte) error {
+	return cc.writeHeadersWithPriority(streamID, endStream, maxFrameSize, hdrs, "")
+}
+
+// requires cc.wmu be held
+func (cc *ClientConn) writeHeadersWithPriority(streamID uint32, endStream bool, maxFrameSize int, hdrs []byte, priorityUpdate string) error {
 	first := true // first frame written (HEADERS is first, then CONTINUATION)
 	for len(hdrs) > 0 && cc.werr == nil {
 		chunk := hdrs
@@ -1523,6 +1551,9 @@ func (cc *ClientConn) writeHeaders(streamID uint32, endStream bool, maxFrameSize
 		} else {
 			cc.fr.WriteContinuation(streamID, endHeaders, chunk)
 		}
+	}
+	if priorityUpdate != "" && cc.werr == nil && validStreamID(streamID) {
+		cc.fr.WritePriorityUpdate(streamID, priorityUpdate)
 	}
 	cc.bw.Flush()
 	return cc.werr
@@ -1793,7 +1824,11 @@ func (cc *ClientConn) writeHeader(name, value string) {
 	if VerboseLogs {
 		log.Printf("http2: Transport encoding header %q = %q", name, value)
 	}
-	cc.henc.WriteField(hpack.HeaderField{Name: name, Value: value})
+	var sensitive bool
+	if len(cc.sensitiveHdrs) > 0 {
+		_, sensitive = cc.sensitiveHdrs[name]
+	}
+	cc.henc.WriteField(hpack.HeaderField{Name: name, Value: value, Sensitive: sensitive})
 }
 
 type resAndError struct {
@@ -1806,7 +1841,11 @@ type resAndError struct {
 func (cc *ClientConn) addStreamLocked(cs *clientStream) {
 	cs.flow.add(int32(cc.initialWindowSize))
 	cs.flow.setConnFlow(&cc.flow)
-	cs.inflow.init(cc.initialStreamRecvWindowSize)
+	streamRefresh := int32(inflowMinRefresh)
+	if cc.fp != nil {
+		streamRefresh = resolveWindowRefresh(cc.initialStreamRecvWindowSize, cc.fp.StreamWindowRefreshBytes, cc.fp.StreamWindowRefreshRatio)
+	}
+	cs.inflow.initWithRefresh(cc.initialStreamRecvWindowSize, streamRefresh)
 	cs.ID = cc.nextStreamID
 	cc.nextStreamID += 2
 	cc.streams[cs.ID] = cs
