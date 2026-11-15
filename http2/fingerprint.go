@@ -77,6 +77,16 @@ type FingerprintProfile struct {
 	// HeaderPriorityUpdate, when non-empty, emits an RFC 9218 PRIORITY_UPDATE
 	// frame (stream 0 targeting the new request stream) coalesced with HEADERS.
 	HeaderPriorityUpdate string
+
+	// NegotiatedPriorityUpdate emits an RFC 9218 PRIORITY_UPDATE frame only
+	// after the server's initial SETTINGS frame advertises
+	// SETTINGS_NO_RFC7540_PRIORITIES = 1. Ignored when HeaderPriorityUpdate
+	// or ContextWithPriorityUpdate is explicitly provided.
+	NegotiatedPriorityUpdate string
+
+	// MaxEncoderHeaderTableSize overrides the client's maximum HPACK encoder
+	// dynamic table size limit (used when Transport.MaxEncoderHeaderTableSize == 0).
+	MaxEncoderHeaderTableSize uint32
 }
 
 // Clone returns a deep copy of the FingerprintProfile, or nil if p is nil.
@@ -243,13 +253,15 @@ func FingerprintChrome() *FingerprintProfile {
 			{ID: SettingInitialWindowSize, Val: 6291456},
 			{ID: SettingMaxHeaderListSize, Val: 262144},
 		},
-		ConnectionFlow:           15663105,
-		PseudoHeaderOrder:        []string{":method", ":authority", ":scheme", ":path"},
-		HeaderOrder:              slices.Clone(chromeHeaderOrder),
-		DefaultUserAgent:         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-		ConnWindowRefreshRatio:   0.5,
-		StreamWindowRefreshRatio: 0.5,
-		SensitiveHeaders:         slices.Clone(defaultBrowserSensitiveHeaders),
+		ConnectionFlow:            15663105,
+		PseudoHeaderOrder:         []string{":method", ":authority", ":scheme", ":path"},
+		HeaderOrder:               slices.Clone(chromeHeaderOrder),
+		DefaultUserAgent:          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+		ConnWindowRefreshRatio:    0.5,
+		StreamWindowRefreshRatio:  0.5,
+		SensitiveHeaders:          slices.Clone(defaultBrowserSensitiveHeaders),
+		NegotiatedPriorityUpdate:  "u=3, i",
+		MaxEncoderHeaderTableSize: 65536,
 	}
 }
 
@@ -279,13 +291,15 @@ func FingerprintFirefox() *FingerprintProfile {
 			{ID: SettingMaxFrameSize, Val: 16384},
 			{ID: SettingNoRFC7540Priorities, Val: 1},
 		},
-		ConnectionFlow:           12517377,
-		PseudoHeaderOrder:        []string{":method", ":path", ":authority", ":scheme"},
-		HeaderOrder:              slices.Clone(firefoxHeaderOrder),
-		DefaultUserAgent:         "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0",
-		ConnWindowRefreshRatio:   0.5,
-		StreamWindowRefreshRatio: 0.5,
-		SensitiveHeaders:         slices.Clone(defaultBrowserSensitiveHeaders),
+		ConnectionFlow:            12517377,
+		PseudoHeaderOrder:         []string{":method", ":path", ":authority", ":scheme"},
+		HeaderOrder:               slices.Clone(firefoxHeaderOrder),
+		DefaultUserAgent:          "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0",
+		ConnWindowRefreshRatio:    0.5,
+		StreamWindowRefreshRatio:  0.5,
+		SensitiveHeaders:          slices.Clone(defaultBrowserSensitiveHeaders),
+		NegotiatedPriorityUpdate:  "u=3, i",
+		MaxEncoderHeaderTableSize: 65536,
 	}
 }
 
@@ -298,6 +312,7 @@ func FingerprintFirefox120() *FingerprintProfile {
 		{ID: SettingInitialWindowSize, Val: 131072},
 		{ID: SettingMaxFrameSize, Val: 16384},
 	}
+	fp.NegotiatedPriorityUpdate = ""
 	fp.DefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0"
 	return fp
 }
@@ -319,6 +334,7 @@ func FingerprintSafari() *FingerprintProfile {
 		ConnWindowRefreshRatio:   0.5,
 		StreamWindowRefreshRatio: 0.5,
 		SensitiveHeaders:         slices.Clone(defaultBrowserSensitiveHeaders),
+		NegotiatedPriorityUpdate: "u=3, i",
 	}
 }
 
@@ -332,6 +348,7 @@ func FingerprintSafari16() *FingerprintProfile {
 		{ID: SettingMaxConcurrentStreams, Val: 100},
 	}
 	fp.ConnectionFlow = 10485760
+	fp.NegotiatedPriorityUpdate = ""
 	fp.DefaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15"
 	return fp
 }

@@ -1092,3 +1092,281 @@ func TestFingerprintPriorityUpdate(t *testing.T) {
 		t.Fatalf("Priority value mismatch: got %q, want %q", res.updates[0].Priority, "u=0")
 	}
 }
+
+func TestFingerprintNegotiatedPriorityUpdate(t *testing.T) {
+	runCase := func(t *testing.T, advertiseExtPrio bool) []PriorityUpdateFrame {
+		t.Helper()
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+
+		type result struct {
+			updates []PriorityUpdateFrame
+			err     error
+		}
+		resCh := make(chan result, 1)
+
+		go func() {
+			conn, err := ln.Accept()
+			if err != nil {
+				resCh <- result{err: err}
+				return
+			}
+			defer conn.Close()
+
+			preface := make([]byte, len(clientPreface))
+			if _, err := io.ReadFull(conn, preface); err != nil {
+				resCh <- result{err: err}
+				return
+			}
+			fr := NewFramer(conn, conn)
+			fr.ReadMetaHeaders = hpack.NewDecoder(65536, nil)
+			var serverSettings []Setting
+			if advertiseExtPrio {
+				serverSettings = []Setting{{ID: SettingNoRFC7540Priorities, Val: 1}}
+			}
+			if err := fr.WriteSettings(serverSettings...); err != nil {
+				resCh <- result{err: err}
+				return
+			}
+
+			var (
+				updates []PriorityUpdateFrame
+				reqs    int
+			)
+			for {
+				f, err := fr.ReadFrame()
+				if err != nil {
+					resCh <- result{updates: updates}
+					return
+				}
+				switch f := f.(type) {
+				case *SettingsFrame:
+					if !f.IsAck() {
+						if err := fr.WriteSettingsAck(); err != nil {
+							resCh <- result{err: err}
+							return
+						}
+					}
+				case *PriorityUpdateFrame:
+					updates = append(updates, *f)
+					if reqs == 2 && advertiseExtPrio {
+						resCh <- result{updates: updates}
+						return
+					}
+				case *MetaHeadersFrame:
+					reqs++
+					var hdrBuf bytes.Buffer
+					enc := hpack.NewEncoder(&hdrBuf)
+					_ = enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+					if err := fr.WriteHeaders(HeadersFrameParam{
+						StreamID:      f.StreamID,
+						BlockFragment: hdrBuf.Bytes(),
+						EndStream:     true,
+						EndHeaders:    true,
+					}); err != nil {
+						resCh <- result{err: err}
+						return
+					}
+					if reqs == 2 && advertiseExtPrio && len(updates) == 0 {
+						// Read one more frame on req 2 to capture the coalesced PRIORITY_UPDATE.
+						continue
+					}
+					if reqs == 2 {
+						resCh <- result{updates: updates}
+						return
+					}
+				}
+			}
+		}()
+
+		tr := &Transport{
+			AllowHTTP:   true,
+			Fingerprint: FingerprintChrome(),
+			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, network, addr)
+			},
+		}
+		defer tr.CloseIdleConnections()
+
+		client := &http.Client{Transport: tr}
+		for i := range 2 {
+			resp, err := client.Get(fmt.Sprintf("https://%s/r%d", ln.Addr().String(), i))
+			if err != nil {
+				t.Fatalf("req %d failed: %v", i, err)
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+		tr.CloseIdleConnections()
+
+		res := <-resCh
+		if res.err != nil {
+			t.Fatalf("server error: %v", res.err)
+		}
+		return res.updates
+	}
+
+	t.Run("without_server_setting", func(t *testing.T) {
+		updates := runCase(t, false)
+		if len(updates) != 0 {
+			t.Fatalf("expected 0 PRIORITY_UPDATE frames without peer advertisement, got %+v", updates)
+		}
+	})
+
+	t.Run("with_server_setting", func(t *testing.T) {
+		updates := runCase(t, true)
+		if len(updates) == 0 {
+			t.Fatal("expected negotiated PRIORITY_UPDATE after server SETTINGS_NO_RFC7540_PRIORITIES=1")
+		}
+		if updates[0].Priority != "u=3, i" {
+			t.Fatalf("unexpected negotiated PRIORITY_UPDATE payload: got %q, want %q", updates[0].Priority, "u=3, i")
+		}
+	})
+}
+
+func TestFingerprintMaxEncoderHeaderTableSize(t *testing.T) {
+	runCheck := func(t *testing.T, fp *FingerprintProfile) (uint32, []int) {
+		t.Helper()
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+
+		type result struct {
+			blockLens []int
+			err       error
+		}
+		resCh := make(chan result, 1)
+		settingsAcked := make(chan struct{})
+		var ackOnce bool
+
+		go func() {
+			conn, err := ln.Accept()
+			if err != nil {
+				resCh <- result{err: err}
+				return
+			}
+			defer conn.Close()
+
+			preface := make([]byte, len(clientPreface))
+			if _, err := io.ReadFull(conn, preface); err != nil {
+				resCh <- result{err: err}
+				return
+			}
+			fr := NewFramer(conn, conn)
+			if err := fr.WriteSettings(Setting{ID: SettingHeaderTableSize, Val: 65536}); err != nil {
+				resCh <- result{err: err}
+				return
+			}
+
+			dec := hpack.NewDecoder(65536, func(hpack.HeaderField) {})
+			var blockLens []int
+			for {
+				f, err := fr.ReadFrame()
+				if err != nil {
+					resCh <- result{err: err}
+					return
+				}
+				switch f := f.(type) {
+				case *SettingsFrame:
+					if f.IsAck() {
+						if !ackOnce {
+							ackOnce = true
+							close(settingsAcked)
+						}
+					} else {
+						if err := fr.WriteSettingsAck(); err != nil {
+							resCh <- result{err: err}
+							return
+						}
+					}
+				case *HeadersFrame:
+					blockLens = append(blockLens, len(f.HeaderBlockFragment()))
+					if _, err := dec.Write(f.HeaderBlockFragment()); err != nil {
+						resCh <- result{err: err}
+						return
+					}
+					_ = dec.Close()
+					var hdrBuf bytes.Buffer
+					enc := hpack.NewEncoder(&hdrBuf)
+					_ = enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+					if err := fr.WriteHeaders(HeadersFrameParam{
+						StreamID:      f.StreamID,
+						BlockFragment: hdrBuf.Bytes(),
+						EndStream:     true,
+						EndHeaders:    true,
+					}); err != nil {
+						resCh <- result{err: err}
+						return
+					}
+					if len(blockLens) == 2 {
+						resCh <- result{blockLens: blockLens}
+						return
+					}
+				}
+			}
+		}()
+
+		var d net.Dialer
+		rawConn, err := d.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		tr := &Transport{
+			AllowHTTP:   true,
+			Fingerprint: fp,
+		}
+		cc, err := tr.NewClientConn(rawConn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cc.Close()
+
+		<-settingsAcked
+
+		bigVal := strings.Repeat("a", 6000)
+		for range 2 {
+			req, err := http.NewRequest(http.MethodGet, "https://"+ln.Addr().String()+"/hdr", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("X-Large-Token", bigVal)
+			resp, err := cc.RoundTrip(req)
+			if err != nil {
+				t.Fatalf("RoundTrip failed: %v", err)
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+
+		res := <-resCh
+		if res.err != nil {
+			t.Fatalf("server error: %v", res.err)
+		}
+		cc.wmu.Lock()
+		maxTab := cc.henc.MaxDynamicTableSize()
+		cc.wmu.Unlock()
+		return maxTab, res.blockLens
+	}
+
+	chromeTab, chromeLens := runCheck(t, FingerprintChrome())
+	if chromeTab != 65536 {
+		t.Fatalf("Chrome HPACK encoder MaxDynamicTableSize=%d, want 65536", chromeTab)
+	}
+	if len(chromeLens) != 2 || chromeLens[1] >= 100 || chromeLens[1] >= chromeLens[0]/4 {
+		t.Fatalf("expected 6 KiB custom header to be dynamically indexed under Chrome 64 KiB table: blockLens=%v", chromeLens)
+	}
+
+	vanillaTab, vanillaLens := runCheck(t, nil)
+	if vanillaTab != initialHeaderTableSize {
+		t.Fatalf("vanilla HPACK encoder MaxDynamicTableSize=%d, want %d", vanillaTab, initialHeaderTableSize)
+	}
+	if len(vanillaLens) != 2 || vanillaLens[1] < 3000 {
+		t.Fatalf("expected 6 KiB header not to fit vanilla 4 KiB table on repeat: blockLens=%v", vanillaLens)
+	}
+}

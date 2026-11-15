@@ -230,6 +230,7 @@ type ClientConn struct {
 	readIdleTimeout             time.Duration
 	pingTimeout                 time.Duration
 	extendedConnectAllowed      bool
+	peerNoRFC7540Priorities     bool
 	strictMaxConcurrentStreams  bool
 
 	// rstStreamPingsBlocked works around an unfortunate gRPC behavior.
@@ -592,7 +593,11 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool, internalStateHook 
 	cc.fr.MaxHeaderListSize = maxHeaderListSize
 
 	cc.henc = hpack.NewEncoder(&cc.hbuf)
-	cc.henc.SetMaxDynamicTableSizeLimit(conf.MaxEncoderHeaderTableSize)
+	maxEncTable := conf.MaxEncoderHeaderTableSize
+	if t.MaxEncoderHeaderTableSize == 0 && fp != nil && fp.MaxEncoderHeaderTableSize > 0 {
+		maxEncTable = fp.MaxEncoderHeaderTableSize
+	}
+	cc.henc.SetMaxDynamicTableSizeLimit(maxEncTable)
 	cc.peerMaxHeaderTableSize = initialHeaderTableSize
 
 	if cs, ok := c.(connectionStater); ok {
@@ -1335,7 +1340,11 @@ func (cs *clientStream) encodeAndWriteHeaders(req *http.Request) error {
 	endStream := !res.HasBody && !res.HasTrailers
 	var priorityUpdate string
 	if cc.fp != nil {
-		priorityUpdate = cc.fp.HeaderPriorityUpdate
+		if cc.fp.HeaderPriorityUpdate != "" {
+			priorityUpdate = cc.fp.HeaderPriorityUpdate
+		} else if cc.peerNoRFC7540Priorities && cc.fp.NegotiatedPriorityUpdate != "" {
+			priorityUpdate = cc.fp.NegotiatedPriorityUpdate
+		}
 	}
 	if ctxPrio := PriorityUpdateFromContext(req.Context()); ctxPrio != "" {
 		priorityUpdate = ctxPrio
@@ -2664,6 +2673,10 @@ func (rl *clientConnReadLoop) processSettingsNoWrite(f *SettingsFrame) error {
 			// seen that frame or not.
 			if !cc.seenSettings {
 				cc.extendedConnectAllowed = s.Val == 1
+			}
+		case SettingNoRFC7540Priorities:
+			if !cc.seenSettings && s.Val <= 1 {
+				cc.peerNoRFC7540Priorities = s.Val == 1
 			}
 		default:
 			cc.vlogf("Unhandled Setting: %v", s)
